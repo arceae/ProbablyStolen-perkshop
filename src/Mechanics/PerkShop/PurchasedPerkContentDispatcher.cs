@@ -279,10 +279,10 @@ namespace PerkShopFramework
         {
             switch (Behavior)
             {
-                case ProviderBehavior.JacksonNotifier:
-                    if (!PurchasedPerkProviderRegistry.TryInvokeJacksonNotifier())
+                case ProviderBehavior.ExternalNotifier:
+                    if (!PurchasedPerkProviderRegistry.TryInvokeExternalNotifier(AssemblyName))
                     {
-                        PerkShopLog.Warning("JacksonPerks.NotifyNewGame 未找到，已继续通过生命周期补丁重放。");
+                        PerkShopLog.Warning("外部特性 Notifier 未找到，已继续通过生命周期补丁重放。" + AssemblyName);
                     }
                     break;
                 case ProviderBehavior.Direct:
@@ -367,7 +367,13 @@ namespace PerkShopFramework
     internal enum ProviderBehavior
     {
         NativeUnified,
-        JacksonNotifier,
+
+        /// <summary>
+        /// 外部 mod 自带「统一 NotifyNewGame()」入口的形态。
+        /// 旧 JacksonPerks / 新 WagePerks 都属于此类，但不以程序集名判定。
+        /// </summary>
+        ExternalNotifier,
+
         FutureTech,
         Direct,
         ActiveOnly
@@ -378,8 +384,15 @@ namespace PerkShopFramework
         private static readonly object Gate = new object();
         private static readonly Dictionary<string, PurchasedPerkProviderBinding> Bindings =
             new Dictionary<string, PurchasedPerkProviderBinding>(StringComparer.Ordinal);
+
+        // ★契约式发现的「外部 Notifier」表：程序集名 -> static NotifyNewGame()。
+        // 不硬编码任何 mod 名，因此改名前后（JacksonPerks → WagePerks → 将来再改）都能命中。
+        private static readonly Dictionary<string, MethodInfo> ExternalNotifiers =
+            new Dictionary<string, MethodInfo>(StringComparer.Ordinal);
+
+        private static string _primaryExternalNotifierAssembly = string.Empty;
         private static bool _scanned;
-        private static MethodInfo? _jacksonNotifier;
+        private static int _scannedAssemblyCount = -1;
 
         internal static PurchasedPerkProviderBinding Resolve(string id)
         {
@@ -395,36 +408,67 @@ namespace PerkShopFramework
             return new PurchasedPerkProviderBinding(InferAssemblyName(id), null, null, ProviderBehavior.NativeUnified);
         }
 
-        internal static bool TryInvokeJacksonNotifier()
+        internal static bool TryInvokeExternalNotifier(string assemblyName)
         {
             EnsureScanned();
-            if (_jacksonNotifier == null)
+            if (string.IsNullOrEmpty(assemblyName))
             {
                 return false;
             }
 
-            _jacksonNotifier.Invoke(null, null);
+            MethodInfo? notifier;
+            lock (Gate)
+            {
+                ExternalNotifiers.TryGetValue(assemblyName, out notifier);
+            }
+
+            if (notifier == null)
+            {
+                return false;
+            }
+
+            notifier.Invoke(null, null);
             return true;
+        }
+
+        /// <summary>该程序集是否被判定为「带统一 Notifier 的外部特性 mod」（供生命周期重放等外部逻辑复用）。</summary>
+        internal static bool IsExternalNotifierAssembly(string assemblyName)
+        {
+            if (string.IsNullOrEmpty(assemblyName))
+            {
+                return false;
+            }
+
+            EnsureScanned();
+            lock (Gate)
+            {
+                return ExternalNotifiers.ContainsKey(assemblyName);
+            }
         }
 
         private static void EnsureScanned()
         {
-            if (_scanned)
+            // 程序集数量增长时允许增量重扫：避免"扫描发生得比某个特性 mod 的加载更早"
+            // 导致该 mod 被永久漏掉（_scanned 一旦置位就不再回头是旧实现的隐患）。
+            if (_scanned && AppDomain.CurrentDomain.GetAssemblies().Length <= _scannedAssemblyCount)
             {
                 return;
             }
 
             lock (Gate)
             {
-                if (_scanned)
+                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                if (_scanned && assemblies.Length <= _scannedAssemblyCount)
                 {
                     return;
                 }
 
                 _scanned = true;
+                _scannedAssemblyCount = assemblies.Length;
+                // 重扫时清掉能力探测缓存：Harmony 补丁可能在本次扫描之后才挂上，缓存必须跟着失效。
+                NativeContentPathCache.Clear();
                 try
                 {
-                    var assemblies = AppDomain.CurrentDomain.GetAssemblies();
                     for (var i = 0; i < assemblies.Length; i++)
                     {
                         var assembly = assemblies[i];
@@ -434,27 +478,15 @@ namespace PerkShopFramework
                             continue;
                         }
 
-                        if (assemblyName == "JacksonPerks")
-                        {
-                            var notifierType = assembly.GetType("JacksonPerks.CustomStartingPerks", false);
-                            _jacksonNotifier = notifierType?.GetMethod(
-                                "NotifyNewGame",
-                                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                        }
-
-                        Type[] types;
-                        try
-                        {
-                            types = assembly.GetTypes();
-                        }
-                        catch (ReflectionTypeLoadException ex)
-                        {
-                            types = ex.Types.Where(type => type != null).ToArray()!;
-                        }
-                        catch
+                        var types = GetScannableTypes(assembly);
+                        if (types.Length == 0)
                         {
                             continue;
                         }
+
+                        // ★契约式发现：不再按程序集名硬编码（旧 JacksonPerks / 新 WagePerks / 将来任何改名都覆盖）。
+                        // 约定 = 「任意命名空间下的 CustomStartingPerks 类型，带 static 零参 NotifyNewGame()」。
+                        BindExternalNotifier(assemblyName, types);
 
                         for (var j = 0; j < types.Length; j++)
                         {
@@ -494,19 +526,27 @@ namespace PerkShopFramework
 
         private static ProviderBehavior ResolveBehavior(string assemblyName, Type type)
         {
-            if (assemblyName == "ExtraPerks" || assemblyName == "PPerkPack" || assemblyName == "XIAOWOTradePerks")
+            if (assemblyName == "FutureTech")
+            {
+                return ProviderBehavior.FutureTech;
+            }
+
+            // ★能力探测（不认 mod 名）——顺序即语义，别调换：
+            // ① 该 mod 自己挂在原生「应用特性内容」调用链上（StartingPerkContent.*，典型是 HandleNewGamePerk）。
+            //    我们 ApplyOne 里本来就会调原生 StartingPerkContent.HandleNewGamePerk()，
+            //    所以它已经会被驱动 → 返回 NativeUnified（**绝不额外再补一次**，
+            //    否则 OnNewGame 触发两遍：丑陋店铺的 -150 吸引力、卡车上掉的货刷箱都会翻倍）。
+            //    典型：ExtraPerks、XIAOWOTradePerks。
+            if (SelfDrivesOnNativeContentPath(assemblyName))
             {
                 return ProviderBehavior.NativeUnified;
             }
 
-            if (assemblyName == "JacksonPerks")
+            // ② 暴露统一入口 <任意命名空间>.CustomStartingPerks.NotifyNewGame()，但不挂原生链
+            //    → 需要我们显式驱动。典型：旧 JacksonPerks / 新 WagePerks。
+            if (IsExternalNotifierAssembly(assemblyName))
             {
-                return ProviderBehavior.JacksonNotifier;
-            }
-
-            if (assemblyName == "FutureTech")
-            {
-                return ProviderBehavior.FutureTech;
+                return ProviderBehavior.ExternalNotifier;
             }
 
             if (FindZeroArgMethod(type, "OnNewGame") != null || FindZeroArgMethod(type, "TryGrant") != null)
@@ -517,7 +557,85 @@ namespace PerkShopFramework
             return ProviderBehavior.ActiveOnly;
         }
 
+        private static readonly Dictionary<string, bool> NativeContentPathCache =
+            new Dictionary<string, bool>(StringComparer.Ordinal);
 
+        /// <summary>
+        /// 探测该程序集是否自己挂在原生 StartingPerkContent.* 上（能力探测，与 mod 名无关）。
+        /// 命中 = 原生调用链已经会驱动它 → NativeUnified（不额外补触发，避免二次发放）。
+        /// </summary>
+        private static bool SelfDrivesOnNativeContentPath(string assemblyName)
+        {
+            lock (Gate)
+            {
+                if (NativeContentPathCache.TryGetValue(assemblyName, out var cached))
+                {
+                    return cached;
+                }
+            }
+
+            var result = false;
+            try
+            {
+                foreach (var method in HarmonyLib.Harmony.GetAllPatchedMethods())
+                {
+                    var declaringType = method.DeclaringType;
+                    if (declaringType == null)
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(declaringType.Name, "StartingPerkContent", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var info = HarmonyLib.Harmony.GetPatchInfo(method);
+                    if (info == null)
+                    {
+                        continue;
+                    }
+
+                    result = OwnedBy(info.Prefixes, assemblyName)
+                        || OwnedBy(info.Postfixes, assemblyName)
+                        || OwnedBy(info.Finalizers, assemblyName);
+                    if (result)
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                PerkShopLog.Warning("原生特性内容挂点探测失败：" + ex.Message);
+            }
+
+            lock (Gate)
+            {
+                NativeContentPathCache[assemblyName] = result;
+            }
+
+            return result;
+        }
+
+        private static bool OwnedBy(IEnumerable<Patch>? patches, string assemblyName)
+        {
+            if (patches == null)
+            {
+                return false;
+            }
+
+            foreach (var patch in patches)
+            {
+                var owner = patch.PatchMethod?.DeclaringType?.Assembly.GetName().Name;
+                if (string.Equals(owner, assemblyName, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         private static MethodInfo? FindProviderMethod(Type type, ProviderBehavior behavior)
         {
@@ -679,8 +797,89 @@ namespace PerkShopFramework
                 return "VainPerson";
             }
 
+            // 无前缀可依的 id —— Wage's Perks 系列用的就是中文特性 id（旧 JacksonPerks / 新 WagePerks）。
+            // 既然已发现外部 Notifier，就归给它；退化成 Assembly-CSharp 等于整条链路静默失效。
+            if (!string.IsNullOrEmpty(_primaryExternalNotifierAssembly) && HasNonAscii(id))
+            {
+                return _primaryExternalNotifierAssembly;
+            }
+
             return "Assembly-CSharp";
         }
+
+        private static bool HasNonAscii(string value)
+        {
+            for (var i = 0; i < value.Length; i++)
+            {
+                if (value[i] > 0x7F)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static Type[] GetScannableTypes(Assembly assembly)
+        {
+            try
+            {
+                return assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                return ex.Types.Where(type => type != null).ToArray()!;
+            }
+            catch
+            {
+                return Type.EmptyTypes;
+            }
+        }
+
+        /// <summary>
+        /// 绑定外部特性 Notifier。★弱契约：只认「类型简名 CustomStartingPerks + static 零参 NotifyNewGame()」，
+        /// 不认命名空间、不认程序集名 —— 从而与具体 mod 名字解耦，
+        /// JacksonPerks、WagePerks 以及将来任何第三次改名都能自动命中。
+        /// </summary>
+        private static void BindExternalNotifier(string assemblyName, Type[] types)
+        {
+            lock (Gate)
+            {
+                if (ExternalNotifiers.ContainsKey(assemblyName))
+                {
+                    return;
+                }
+            }
+
+            for (var i = 0; i < types.Length; i++)
+            {
+                var type = types[i];
+                if (type == null || !string.Equals(type.Name, "CustomStartingPerks", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var notifier = FindZeroArgMethod(type, "NotifyNewGame");
+                if (notifier == null || !notifier.IsStatic)
+                {
+                    continue;
+                }
+
+                lock (Gate)
+                {
+                    ExternalNotifiers[assemblyName] = notifier;
+                    if (string.IsNullOrEmpty(_primaryExternalNotifierAssembly))
+                    {
+                        _primaryExternalNotifierAssembly = assemblyName;
+                    }
+                }
+
+                PerkShopLog.Msg("已绑定外部特性 Notifier：" + assemblyName + " → "
+                    + (notifier.DeclaringType?.FullName ?? type.Name) + ".NotifyNewGame");
+                return;
+            }
+        }
+
         private static string SafeAssemblyName(Assembly assembly)
         {
             try

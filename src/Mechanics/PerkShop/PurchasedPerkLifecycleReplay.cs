@@ -104,11 +104,12 @@ namespace PerkShopFramework
                     continue;
                 }
 
-                // WagesPerks runs the global reset through NotifyNewGame separately.
-                // Replaying this postfix would reset all previously purchased WagesPerks state.
-                if (string.Equals(assemblyName, "JacksonPerks", StringComparison.Ordinal)
-                    && string.Equals(targetMethod.Name, "NewGame", StringComparison.Ordinal)
-                    && string.Equals(patchMethod.DeclaringType?.FullName, "JacksonPerks.Patches", StringComparison.Ordinal))
+                // Notifier 型外部 mod（旧 JacksonPerks / 新 WagePerks）的全局重置由 NotifyNewGame 单独负责；
+                // 重放它的 Patches.NewGame 会把此前已购买的同类特性状态一并重置。
+                // 判定改为「已绑定的 Notifier 程序集 + 类型简名 Patches + NewGame」——同样不硬编码 mod 名。
+                if (string.Equals(targetMethod.Name, "NewGame", StringComparison.Ordinal)
+                    && string.Equals(patchMethod.DeclaringType?.Name, "Patches", StringComparison.Ordinal)
+                    && PurchasedPerkProviderRegistry.IsExternalNotifierAssembly(ownerAssembly))
                 {
                     continue;
                 }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using HarmonyLib;
 using Il2Cpp;
@@ -148,8 +149,11 @@ namespace PerkShopFramework
                 {
                     for (var i = 0; i < perks.Count; i++)
                     {
-                        var id = GetPerkId(perks[i]);
-                        if (string.Equals(id.TrimEnd('\0'), "拾荒者之王", StringComparison.Ordinal))
+                        var id = GetPerkId(perks[i]).TrimEnd('\0');
+                        // 该 mod 有两个 id 空间：汉化版用中文 Id（拾荒者之王），英文原版用稳定常量 PerkId（ScavengersReign）。
+                        // 两个都认，避免「装了/卸了汉化」就静默失效。
+                        if (string.Equals(id, "拾荒者之王", StringComparison.Ordinal)
+                            || string.Equals(id, "ScavengersReign", StringComparison.Ordinal))
                         {
                             ownsScavengersReign = true;
                             break;
@@ -571,7 +575,7 @@ private static Type? FindLoadedType(string typeName)
                 return null;
             }
 
-            // 只按精确类型名定向查找，不枚举程序集内全部类型。
+            // 1) 精确类型名定向查找（既有行为，零成本、零风险）。
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
                 try
@@ -587,10 +591,45 @@ private static Type? FindLoadedType(string typeName)
                 }
             }
 
+            // 2) 兜底：按「简名」匹配任意命名空间下的同名类型。
+            //    既有的 Fred("DestinyDicePerk") / ("FrogPowerPerk") / ("CustomStorageContainer") / ("DestinyDice")
+            //    传的都是简名，在 JacksonPerks / WagePerks 命名空间下永远取不到 → 发放修复链静默空转。
+            //    这里按 Name 全等匹配（不按子串），并把命名空间变化（改名）一并覆盖。
+            if (typeName.IndexOf('.') >= 0)
+            {
+                return null;
+            }
+
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    types = ex.Types.Where(type => type != null).ToArray()!;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < types.Length; i++)
+                {
+                    var type = types[i];
+                    if (type != null && string.Equals(type.Name, typeName, StringComparison.Ordinal))
+                    {
+                        return type;
+                    }
+                }
+            }
+
             return null;
         }
 
-        private static bool _extraPerksCompatibilityInstalled;
+        private static bool _inventoryGrantRedirectInstalled;
         private static bool _vainPersonCompatibilityInstalled;
 
         public static void TryInstallOptionalCompatibilityPatches(HarmonyLib.Harmony harmony)
@@ -600,39 +639,102 @@ private static Type? FindLoadedType(string typeName)
                 return;
             }
 
-            TryInstallExtraPerksCompatibility(harmony);
+            TryInstallInventoryGrantRedirect(harmony);
             TryInstallVainPersonCompatibility(harmony);
         }
 
-        private static void TryInstallExtraPerksCompatibility(HarmonyLib.Harmony harmony)
+        /// <summary>
+        /// ★契约式（不认 mod 名）：凡是「类型简名叫 InventoryGrant 且带 static bool TryGrant(string)」的类型，
+        /// 一律视为特性 mod 的开局发放入口，统一挂重定向 Prefix，把物品改投到玩家背包/柜台。
+        /// 旧实现写死 `ExtraPerks.InventoryGrant` —— mod 一旦改名（如 JacksonPerks → WagePerks）就会静默失效。
+        /// 未发现目标时**不置位**，留待下次购买重试（mod 可能稍后才加载）。
+        /// </summary>
+        private static void TryInstallInventoryGrantRedirect(HarmonyLib.Harmony harmony)
         {
-            if (_extraPerksCompatibilityInstalled)
+            if (_inventoryGrantRedirectInstalled)
             {
                 return;
             }
 
             try
             {
-                var grantType = FindLoadedType("ExtraPerks.InventoryGrant");
-                var target = grantType == null ? null : AccessTools.Method(grantType, "TryGrant", new[] { typeof(string) });
-                if (target == null)
-                {
-                    return;
-                }
-
-                var prefix = AccessTools.Method(typeof(ExtraPerksInventoryGrantRedirectPatch), "Prefix", new[] { typeof(string) });
+                var prefix = AccessTools.Method(
+                    typeof(PurchasedContentInventoryGrantRedirectPatch), "Prefix", new[] { typeof(string) });
                 if (prefix == null)
                 {
                     return;
                 }
 
-                harmony.Patch(target, new HarmonyMethod(prefix));
-                _extraPerksCompatibilityInstalled = true;
-                PerkShopLog.Msg("ExtraPerks inventory grant redirect installed.");
+                var installed = 0;
+                foreach (var target in EnumerateInventoryGrantTargets())
+                {
+                    harmony.Patch(target, new HarmonyMethod(prefix));
+                    installed++;
+                    PerkShopLog.Msg("特性 mod 开局发放重定向已挂载：" + target.DeclaringType?.FullName);
+                }
+
+                if (installed > 0)
+                {
+                    _inventoryGrantRedirectInstalled = true;
+                }
+                else
+                {
+                    PerkShopLog.Debug("未发现 InventoryGrant 型发放入口，本次跳过（下次购买重试）。");
+                }
             }
             catch (Exception ex)
             {
-                PerkShopLog.Warning("ExtraPerks compatibility patch failed: " + ex.Message);
+                PerkShopLog.Warning("InventoryGrant 重定向挂载失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>枚举所有「InventoryGrant.TryGrant(string) : bool」形态的发放入口（跨程序集、跨命名空间）。</summary>
+        private static IEnumerable<MethodInfo> EnumerateInventoryGrantTargets()
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    types = ex.Types.Where(type => type != null).ToArray()!;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < types.Length; i++)
+                {
+                    var type = types[i];
+                    if (type == null || !string.Equals(type.Name, "InventoryGrant", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    MethodInfo? method;
+                    try
+                    {
+                        method = type.GetMethod(
+                            "TryGrant",
+                            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                            null,
+                            new[] { typeof(string) },
+                            null);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (method != null && method.ReturnType == typeof(bool))
+                    {
+                        yield return method;
+                    }
+                }
             }
         }
 
@@ -674,7 +776,7 @@ private static Type? FindLoadedType(string typeName)
             return false;
         }
     }
-    internal static class ExtraPerksInventoryGrantRedirectPatch
+    internal static class PurchasedContentInventoryGrantRedirectPatch
     {
         private static bool Prefix(string identifier)
         {
