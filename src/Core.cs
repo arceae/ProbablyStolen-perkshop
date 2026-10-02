@@ -4,7 +4,7 @@ using MelonLoader;
 
 [assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
 [assembly: System.Reflection.AssemblyFileVersion("0.2.0.0")]
-[assembly: MelonInfo(typeof(PerkShopFramework.Core), "PerkShop Framework", "0.2.0", "Codex", "D:\\perkshop-局内购买天赋 的规范重建版")]
+[assembly: MelonInfo(typeof(PerkShopFramework.Core), "PerkShop Framework", "0.2.0", "Codex", "https://github.com/arcaeae/PerkShopFramework")]
 [assembly: MelonGame("Questing Goose Studio", "Probably Stolen")]
 
 namespace PerkShopFramework;
