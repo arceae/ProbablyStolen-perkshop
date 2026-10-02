@@ -2,9 +2,9 @@ using System;
 using HarmonyLib;
 using MelonLoader;
 
-[assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.2.0.0")]
-[assembly: MelonInfo(typeof(PerkShopFramework.Core), "PerkShop Framework", "0.2.0", "Codex", "https://github.com/arceae/ProbablyStolen-perkshop")]
+[assembly: System.Reflection.AssemblyVersion("0.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.3.0.0")]
+[assembly: MelonInfo(typeof(PerkShopFramework.Core), "PerkShop Framework", "0.3.0", "Codex", "https://github.com/arceae/ProbablyStolen-perkshop")]
 [assembly: MelonGame("Questing Goose Studio", "Probably Stolen")]
 
 namespace PerkShopFramework;
