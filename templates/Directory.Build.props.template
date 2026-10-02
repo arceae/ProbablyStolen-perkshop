@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <GameDir>__GAME_DIR_XML__</GameDir>
+  </PropertyGroup>
+</Project>
+

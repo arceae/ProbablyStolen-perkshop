@@ -1,0 +1,46 @@
+param([string]$GameDir = '')
+
+# 唯一受支持的发布入口；本脚本会调用 build.ps1，不要预先运行 dotnet build / MSBuild。
+# 正式打包前，AI 必须先按 RELEASE_GUIDE.md 统一身份、清理 sample，并用正式身份完成验证。
+
+$ErrorActionPreference = 'Stop'
+$projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+& (Join-Path $projectDir 'build.ps1') -GameDir $GameDir
+
+$dll = Join-Path $projectDir 'bin\Release\net6.0\PerkShopFramework.dll'
+$version = [System.Reflection.AssemblyName]::GetAssemblyName($dll).Version.ToString(3)
+$releaseDir = Join-Path $projectDir 'release'
+$zipPath = Join-Path $releaseDir ("PerkShopFramework-v$version.zip")
+$stageDir = Join-Path ([System.IO.Path]::GetTempPath()) ('PerkShopFramework-package-' + [guid]::NewGuid().ToString('N'))
+
+New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+New-Item -ItemType Directory -Path $stageDir | Out-Null
+try {
+    Copy-Item -LiteralPath $dll -Destination $stageDir
+
+    # README.md 是框架开发文档，不属于游戏运行包。
+    # 创作者需要玩家说明时使用 MOD_README.md，发布包内再命名为 README.md。
+    $modReadme = Join-Path $projectDir 'MOD_README.md'
+    if (Test-Path -LiteralPath $modReadme) {
+        $readmeText = [System.IO.File]::ReadAllText($modReadme)
+        if ($readmeText -match '__[A-Z0-9_]+__') {
+            throw 'MOD_README.md 仍包含未替换的发布占位符。'
+        }
+        Copy-Item -LiteralPath $modReadme -Destination (Join-Path $stageDir 'README.md')
+    }
+
+    foreach ($name in @('LICENSE', 'LICENSE.md')) {
+        $path = Join-Path $projectDir $name
+        if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $stageDir }
+    }
+    Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -Force
+}
+finally {
+    if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force }
+}
+
+$hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+Write-Host "PerkShopFramework发布包已生成：$zipPath"
+Write-Host '运行包白名单：MOD DLL、可选 MOD_README.md、可选许可证。'
+Write-Host "SHA-256：$hash"
+

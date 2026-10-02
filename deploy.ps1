@@ -1,0 +1,28 @@
+param([string]$GameDir = '')
+
+# 唯一受支持的部署入口；不要改用 dotnet publish 或手工复制覆盖。
+# 部署会写入游戏 Mods 目录；先阅读 RELEASE_GUIDE.md，并确认已获得用户明确授权。
+
+$ErrorActionPreference = 'Stop'
+$projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $projectDir 'scripts\GamePath.ps1')
+$GameDir = Resolve-ProbablyStolenGameDir -ExplicitGameDir $GameDir -ProjectDir $projectDir
+
+& (Join-Path $projectDir 'build.ps1') -GameDir $GameDir
+$sourceDll = Join-Path $projectDir 'bin\Release\net6.0\PerkShopFramework.dll'
+$modsDir = Join-Path $GameDir 'Mods'
+$targetDll = Join-Path $modsDir 'PerkShopFramework.dll'
+New-Item -ItemType Directory -Path $modsDir -Force | Out-Null
+
+if (Test-Path -LiteralPath $targetDll) {
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backup = "$targetDll.bak-$stamp"
+    Copy-Item -LiteralPath $targetDll -Destination $backup
+    Write-Host "旧版已备份：$backup"
+}
+Copy-Item -LiteralPath $sourceDll -Destination $targetDll -Force
+
+$sourceHash = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
+$targetHash = (Get-FileHash -LiteralPath $targetDll -Algorithm SHA256).Hash
+if ($sourceHash -ne $targetHash) { throw '部署后 DLL 校验失败。' }
+Write-Host "PerkShopFramework已部署：$targetDll"

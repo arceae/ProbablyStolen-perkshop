@@ -1,0 +1,9 @@
+bin/
+obj/
+release/
+local.settings.json
+Directory.Build.props
+.analysis/
+*.log
+.vs/
+*.user
